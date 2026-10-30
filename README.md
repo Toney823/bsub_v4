@@ -12,7 +12,8 @@ command is submitted as its own LSF job.
 - **脚本提交模式**：兼容早期 `bsub_v3.py` 的用法，读取脚本、生成带 `#BSUB` 指令的提交文件。
 - **`interact` 命令控制台**：逐行输入命令，每条命令独立提交为 LSF 作业，作业结束后回显 stdout/stderr。
 - **节点选择**：`-m` 留空时，根据 `-p` 从 `bmgroup -w` 匹配节点组，并用 `bhosts -w` 挑选状态为 `ok`、`NJOBS` 最少的节点。
-- **Conda 环境**：`-e` 指定环境名后，每条命令作业都会自动 `conda activate`；控制台里的 `conda activate/deactivate` 也会被记录并应用到后续作业。
+- **Conda 环境**：每个作业结束时会记录计算节点上的当前环境，后续作业启动时自动恢复；`-e` 可指定初始环境。
+- **受控的环境切换**：会话内最多允许一次 `activate` 切换到命名环境、一次 `deactivate` 返回 base，且必须单独成行输入（不能写成 `conda activate x && python y`）。
 - **日志归档**：每会话的作业脚本与日志保存在 `~/.interface/jobs/<session>/`。
 
 ## 依赖
