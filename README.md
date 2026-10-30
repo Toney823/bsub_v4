@@ -1,62 +1,61 @@
 # bsub_v4
 
+**English** | [简体中文](README.zh-CN.md)
+
 A lightweight command-line frontend for IBM Spectrum LSF. It supports the classic
-script-submission interface and a batch-backed command console where every entered
-command is submitted as its own LSF job.
+script-submission interface and a batch-backed command console in which every
+entered command is submitted as its own LSF job.
 
-一个面向 IBM Spectrum LSF 的轻量命令行封装：既可以提交现成的 Shell 脚本，也可以
-开启一个「批处理控制台」，把每条命令作为独立作业提交并回显输出。
+## Features
 
-## 功能
+- **Script submission mode**: compatible with the earlier `bsub_v3.py`; reads a script and generates a submission file with `#BSUB` directives.
+- **`interact` console**: type one command per line; each command is submitted as an independent LSF job, and its stdout/stderr are shown when the job finishes.
+- **Node selection**: when `-m` is given without a host, the script matches a host group from `bmgroup -w` for the `-p` queue and picks the `ok` host with the fewest `NJOBS` from `bhosts -w`.
+- **Conda environments**: after each job the active environment on the compute node is recorded and restored before the next job; `-e` sets the initial environment.
+- **Controlled environment switching**: at most one `activate` to a named environment and one `deactivate` back to base per session, each entered on its own line (not `conda activate x && python y`).
+- **Log archiving**: per-session job scripts and logs are stored in `~/.interface/jobs/<session>/`.
 
-- **脚本提交模式**：兼容早期 `bsub_v3.py` 的用法，读取脚本、生成带 `#BSUB` 指令的提交文件。
-- **`interact` 命令控制台**：逐行输入命令，每条命令独立提交为 LSF 作业，作业结束后回显 stdout/stderr。
-- **节点选择**：`-m` 留空时，根据 `-p` 从 `bmgroup -w` 匹配节点组，并用 `bhosts -w` 挑选状态为 `ok`、`NJOBS` 最少的节点。
-- **Conda 环境**：每个作业结束时会记录计算节点上的当前环境，后续作业启动时自动恢复；`-e` 可指定初始环境。
-- **受控的环境切换**：会话内最多允许一次 `activate` 切换到命名环境、一次 `deactivate` 返回 base，且必须单独成行输入（不能写成 `conda activate x && python y`）。
-- **日志归档**：每会话的作业脚本与日志保存在 `~/.interface/jobs/<session>/`。
-
-## 依赖
+## Requirements
 
 - Python 3.6+
-- Linux 登录节点，PATH 中可用的 LSF 命令：`bsub`、`bjobs`、`bhosts`、`bmgroup`
-- 交互控制台使用 `readline`/`termios`（缺失时会自动降级）
+- A Linux login node with LSF commands on `PATH`: `bsub`, `bjobs`, `bhosts`, `bmgroup`
+- The console uses `readline`/`termios` and degrades gracefully when they are missing
 
-## 用法
+## Usage
 
 ```bash
 python3 bsub_v4.py -h
 ```
 
-### 1. 提交脚本
+### 1. Submit a script
 
 ```bash
 python3 bsub_v4.py -s run.sh -n test -p fatA -c 4 -y
 ```
 
-- `-s` 脚本路径，`-n` 任务名，`-p` LSF 队列，`-c` CPU 数
-- `-m` 可选：指定节点；`-m` 后留空则自动挑选 NJOBS 最少的 ok 节点
-- `-y` 跳过确认直接提交
+- `-s` script path, `-n` job name, `-p` LSF queue, `-c` CPU count
+- `-m` optional: a specific host; an empty `-m` picks the `ok` host with the fewest `NJOBS`
+- `-y` skip the confirmation prompt
 
-### 2. 批处理控制台
+### 2. Batch-backed console
 
 ```bash
 python3 bsub_v4.py interact -c 1 -n dev -p fatA -l 'hostname'
 python3 bsub_v4.py interact -c 1 -n dev -p fatA -e esmfold -l 'python --version'
 ```
 
-- `-l` 是进入控制台后执行的第一条命令
-- `-e` 可选，指定 Conda 环境（默认不激活）
-- 输入 `exit` / `quit` 或 Ctrl-D 退出
+- `-l` is the first command executed after entering the console
+- `-e` optional initial Conda environment (default: none)
+- Enter `exit` / `quit` or press Ctrl-D to leave
 
-## 注意
+## Notes
 
-`interact` 不是持久远程 Shell，也不提供 TTY/PTY：
+`interact` is not a persistent remote shell and provides no TTY/PTY:
 
-- 每条命令都是一个独立批处理作业，普通变量和 `export` 不会跨作业保留；
-- `cd` 只在登录节点维护会话工作目录，不改变计算节点上的路径；
-- 需要跨作业保留的状态请写进 `~/.interface/init.sh`（每个作业都会 source 它）。
+- Each command is an independent batch job; ordinary shell variables and `export`s are not carried across jobs.
+- `cd` only maintains the session working directory on the login node, not on compute nodes.
+- Keep state that must survive across jobs in `~/.interface/init.sh`, which every job sources.
 
-## 许可
+## License
 
-本项目采用 [MIT License](LICENSE)。
+Released under the [MIT License](LICENSE).
