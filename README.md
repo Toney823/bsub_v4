@@ -11,8 +11,8 @@ entered command is submitted as its own LSF job.
 - **Script submission mode**: compatible with the earlier `bsub_v3.py`; reads a script and generates a submission file with `#BSUB` directives.
 - **`interact` console**: type one command per line; each command is submitted as an independent LSF job, and its stdout/stderr are shown when the job finishes.
 - **Node selection**: when `-m` is given without a host, the script matches a host group from `bmgroup -w` for the `-p` queue and picks the `ok` host with the fewest `NJOBS` from `bhosts -w`.
-- **Conda environments**: after each job the active environment on the compute node is recorded and restored before the next job; `-e` sets the initial environment.
-- **Controlled environment switching**: at most one `activate` to a named environment and one `deactivate` back to base per session, each entered on its own line (not `conda activate x && python y`).
+- **Conda environments**: `conda activate ENV` and `conda deactivate` are local console controls and submit no job; the selected environment is prepended as `source activate ENV` to the next real command. `-e` sets the initial environment.
+- **Controlled environment switching**: at most one switch from base/empty to a named environment and one `deactivate` back to base per session; a transition must be entered on its own line (not `conda activate x && python y`) and is otherwise rejected locally.
 - **Log archiving**: per-session job scripts and logs are stored in `~/.interface/jobs/<session>/`.
 
 ## Requirements

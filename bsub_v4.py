@@ -6,9 +6,10 @@ bsub_v4.py - LSF Batch Submission and Command Console
 A lightweight command-line frontend for IBM Spectrum LSF. It provides two
 working modes: the original script-submission interface and an interactive
 command console that submits each entered command as a separate batch job.
-The console is batch-backed; it does not create a persistent remote shell or
-a pseudo-terminal. Its Conda state is restored between jobs, with one allowed
-environment activation from base/empty and one deactivation back to base.
+The console is batch-backed; Conda environment changes are local session
+state updates and are applied only to the next submitted command. The selected
+environment is activated at the start of each real batch job. The console does
+not create a persistent remote shell or a pseudo-terminal.
 """
 
 import argparse
@@ -331,9 +332,9 @@ class InteractConsole:
         self.queue = queue
         explicit_environment = (environment or "").strip()
 
-        # With an empty -e, do not inject an activation command into the first
-        # job. The initial label is taken from the login shell only for display
-        # and policy checks; the first job reports the actual compute-node env.
+        # With an empty -e, do not inject an activation command into jobs.
+        # If the login shell exposes CONDA_DEFAULT_ENV, use it only as the
+        # initial prompt/policy label; no remote probe job is submitted.
         if explicit_environment:
             self.environment = explicit_environment
             self.environment_label = self.display_environment(explicit_environment)
@@ -427,9 +428,10 @@ class InteractConsole:
             raise EOFError
         if args[0] in ("help", "?"):
             print("普通命令：每行提交一个普通 LSF 批处理作业；exit/quit 退出。")
-            print("cd 在登录节点更新工作目录；当前 Conda 环境会在每个作业启动时恢复。")
-            print("每个会话最多允许一次 activate 环境切换，以及一次 deactivate 回到 base。")
-            print("activate/deactivate 必须单独输入，不能与其他命令用 ; 或 && 连接。")
+            print("cd、conda activate、conda deactivate 均由登录节点客户端维护，不提交 LSF 作业。")
+            print("环境切换只修改会话目标；下一条真正提交的命令才会自动 source activate 目标环境。")
+            print("每个会话最多允许一次从 base/空环境切换到命名环境，以及一次 deactivate 回到 base。")
+            print("环境切换命令必须单独输入，不能与其他命令用 ; 或 && 连接。")
             print("日志目录: %s" % self.session_dir)
             return True
         if args[0] == "cd":
@@ -454,6 +456,12 @@ class InteractConsole:
         return False
 
     def handle_environment_command(self, command):
+        """Treat Conda activate/deactivate as local controls; never submit them.
+
+        The selected environment is remembered by this client. It is activated
+        at the start of the next real batch command, so switching environments
+        itself consumes no LSF job or CPU time.
+        """
         parsed = self.parse_environment_command(command)
         if parsed is None:
             return False
@@ -466,139 +474,79 @@ class InteractConsole:
         current = (self.environment_label or "").strip().lower()
         if action == "activate":
             if current and current != "base":
-                print("[环境] 当前环境为 %s，禁止在非 base 环境中重复 activate；未提交作业。" %
+                print("[环境] 当前目标环境为 %s，禁止在非 base 环境中重复 activate；未提交作业。" %
                       self.environment_label, file=sys.stderr, flush=True)
                 return True
             if self.activation_used:
                 print("[环境] 本会话的一次环境切换额度已使用；不允许再次 activate，未提交作业。",
                       file=sys.stderr, flush=True)
                 return True
+
             target_label = self.display_environment(target)
             if target_label.lower() == current and target_label:
-                print("[环境] 当前已经处于 %s 环境；无需提交。" % target_label,
+                # `conda activate base` is a harmless local selection. It does
+                # not consume the one allowed switch to a named environment.
+                self.environment = target
+                self.environment_label = target_label
+                self.restore_environment = True
+                print("[环境] 目标环境保持为 %s；不提交作业。" % target_label,
                       file=sys.stderr, flush=True)
                 return True
-            self.submit_command(command, env_action=("activate", target))
+
+            self.environment = target
+            self.environment_label = target_label
+            self.restore_environment = True
+            if target_label.lower() != "base":
+                self.activation_used = True
+            print("[环境] 已将目标环境设为 %s；本次不提交作业。下一条计算命令将自动在脚本开头执行 source activate。" %
+                  target_label, file=sys.stderr, flush=True)
             return True
 
-        # deactivate is only meaningful from a non-base, non-empty environment.
+        # One local transition from a named environment back to base.
         if self.deactivation_used:
             print("[环境] 本会话已经执行过一次 deactivate；不允许再次执行，未提交作业。",
                   file=sys.stderr, flush=True)
             return True
         if not current or current == "base":
-            print("[环境] 当前处于 base 或未激活环境，无需 deactivate；未提交作业。",
+            print("[环境] 当前目标环境为 base 或未指定环境，无需 deactivate；未提交作业。",
                   file=sys.stderr, flush=True)
             return True
-        self.submit_command(command, env_action=("deactivate", "base"))
+
+        self.environment = "base"
+        self.environment_label = "base"
+        self.restore_environment = True
+        self.deactivation_used = True
+        print("[环境] 已将目标环境切回 base；本次不提交作业。下一条计算命令将自动在脚本开头执行 source activate base。",
+              file=sys.stderr, flush=True)
         return True
 
-    def build_body(self, command, state_path, env_action=None):
-        lines = [
-            "__bsub_v4_state_file=%s" % shlex.quote(str(state_path)),
-            "__bsub_v4_save_env() { printf '%s\\n%s\\n' \"${CONDA_DEFAULT_ENV-}\" \"${CONDA_PREFIX-}\" > \"$__bsub_v4_state_file\"; }",
-        ]
+    def build_body(self, command):
+        """Build one job body and prepend the selected environment if needed."""
+        lines = []
         if self.init_file.is_file():
             lines.append("source %s || exit 125" % shlex.quote(str(self.init_file)))
         lines += [
             "if ! type conda >/dev/null 2>&1 && command -v conda >/dev/null 2>&1; then",
             "  eval \"$(conda shell.bash hook 2>/dev/null)\" || true",
             "fi",
-            "__bsub_v4_activate() {",
-            "  local __env=\"$1\" __base",
-            "  if ! type conda >/dev/null 2>&1; then echo '错误: conda 命令不可用' >&2; return 127; fi",
-            "  __base=\"$(conda info --base 2>/dev/null)\" || return 127",
-            "  if [ -f \"$__base/bin/activate\" ]; then source \"$__base/bin/activate\" \"$__env\"; else conda activate \"$__env\"; fi",
-            "}",
         ]
-
-        # With an empty -e, the first job uses the environment inherited from
-        # the submit shell / init.sh unchanged. Once detected, later jobs restore
-        # the captured environment before running the requested command.
         if self.restore_environment and self.environment:
+            env = shlex.quote(self.environment)
+            # Prefer the Conda base activation script when available. This is
+            # equivalent to `source activate ENV` and works even when `activate`
+            # is not itself on PATH in a non-interactive batch shell.
             lines += [
-                "__bsub_v4_activate %s" % shlex.quote(self.environment),
-                "__bsub_v4_restore_status=$?",
-                "if [ $__bsub_v4_restore_status -ne 0 ]; then __bsub_v4_save_env; exit $__bsub_v4_restore_status; fi",
-            ]
-
-        if env_action and env_action[0] == "activate":
-            target = shlex.quote(env_action[1])
-            lines += [
-                "if [ -n \"${CONDA_DEFAULT_ENV-}\" ] && [ \"${CONDA_DEFAULT_ENV}\" != base ]; then",
-                "  echo \"错误: 当前计算节点环境为 ${CONDA_DEFAULT_ENV}，只允许从 base/空环境切换一次\" >&2",
-                "  __bsub_v4_save_env; exit 126",
+                "__bsub_v4_conda_base=\"$(conda info --base 2>/dev/null)\"",
+                "if [ -n \"$__bsub_v4_conda_base\" ] && [ -f \"$__bsub_v4_conda_base/bin/activate\" ]; then",
+                "  source \"$__bsub_v4_conda_base/bin/activate\" %s || exit $?" % env,
+                "else",
+                "  source activate %s || exit $?" % env,
                 "fi",
-                "__bsub_v4_activate %s" % target,
-                "__bsub_v4_activate_status=$?",
-                "if [ $__bsub_v4_activate_status -ne 0 ]; then __bsub_v4_save_env; exit $__bsub_v4_activate_status; fi",
             ]
-        elif env_action and env_action[0] == "deactivate":
-            lines += [
-                "if [ -z \"${CONDA_DEFAULT_ENV-}\" ] || [ \"${CONDA_DEFAULT_ENV}\" = base ]; then",
-                "  echo '错误: 当前计算节点没有处于非 base Conda 环境' >&2",
-                "  __bsub_v4_save_env; exit 126",
-                "fi",
-                "conda deactivate",
-                "__bsub_v4_deactivate_status=$?",
-                "if [ $__bsub_v4_deactivate_status -ne 0 ]; then __bsub_v4_save_env; exit $__bsub_v4_deactivate_status; fi",
-                "__bsub_v4_activate base",
-                "__bsub_v4_base_status=$?",
-                "if [ $__bsub_v4_base_status -ne 0 ]; then __bsub_v4_save_env; exit $__bsub_v4_base_status; fi",
-            ]
-        else:
-            lines.append(command)
-            lines.append("__bsub_v4_command_status=$?")
-            lines.append("__bsub_v4_save_env")
-            lines.append('exit "$__bsub_v4_command_status"')
-            return "\n".join(lines)
-
-        lines.append("__bsub_v4_save_env")
+        lines.append(command)
         return "\n".join(lines)
 
-    def update_environment_state(self, state_path, env_action=None, status=None):
-        """Update the prompt and enforce one activate + one deactivate per session."""
-        if not state_path.is_file():
-            return
-        try:
-            values = state_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            print("[环境] 无法读取环境状态: %s" % exc, file=sys.stderr)
-            return
-        env_name = values[0].strip() if values else ""
-        env_prefix = values[1].strip() if len(values) > 1 else ""
-        new_target = env_prefix or env_name
-        new_label = self.display_environment(env_name or env_prefix)
-        old_label = self.environment_label
-        old_lower = (old_label or "").lower()
-        new_lower = (new_label or "").lower()
-
-        self.environment = new_target
-        self.environment_label = new_label
-        self.restore_environment = bool(new_target)
-
-        if status == "DONE" and env_action:
-            if env_action[0] == "activate" and new_lower not in ("", "base"):
-                self.activation_used = True
-            elif env_action[0] == "deactivate" and new_lower == "base":
-                self.deactivation_used = True
-        else:
-            # Also account for a state change made by a shell script or another
-            # supported activation form, so the one-switch limit cannot be bypassed.
-            if old_lower in ("", "base") and new_lower not in ("", "base"):
-                self.activation_used = True
-            if old_lower not in ("", "base") and new_lower == "base":
-                self.deactivation_used = True
-
-        if old_lower != new_lower:
-            if new_label:
-                print("[环境] 当前环境: %s；后续作业将自动恢复。" % new_label,
-                      file=sys.stderr, flush=True)
-            else:
-                print("[环境] 当前没有激活 Conda 环境；后续作业不添加环境激活命令。",
-                      file=sys.stderr, flush=True)
-
-    def submit_command(self, command, env_action=None):
+    def submit_command(self, command):
         self.counter += 1
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         stem = "%04d_%s" % (self.counter, stamp)
@@ -607,17 +555,13 @@ class InteractConsole:
         script_path = self.session_dir / (stem + ".sh")
         out_path = self.session_dir / (stem + ".out")
         err_path = self.session_dir / (stem + ".err")
-        state_path = self.session_dir / (stem + ".env")
         script = make_bsub_script(job_name, self.queue, self.cpu, out_path, err_path,
-                                  self.cwd, self.build_body(command, state_path, env_action))
+                                  self.cwd, self.build_body(command))
         script_path.write_text(script + "\n", encoding="utf-8")
-        if env_action:
-            if env_action[0] == "activate":
-                print("\n[环境] 提交一次环境切换: %s" % env_action[1], file=sys.stderr, flush=True)
-            else:
-                print("\n[环境] 提交 deactivate，返回 base", file=sys.stderr, flush=True)
-        else:
-            print("\n[提交] %s" % command, file=sys.stderr, flush=True)
+        print("\n[提交] %s" % command, file=sys.stderr, flush=True)
+        if self.restore_environment and self.environment:
+            print("[环境] 本次作业将自动 source activate %s" % self.environment,
+                  file=sys.stderr, flush=True)
         try:
             job_id, message, _ = call_bsub(script_path)
         except RuntimeError as exc:
@@ -641,7 +585,6 @@ class InteractConsole:
             print("日志文件: %s ; %s" % (out_path, err_path), file=sys.stderr)
             return
         print_job_logs(out_path, err_path, job_id, status)
-        self.update_environment_state(state_path, env_action, status)
 
     def execute_input(self, command):
         if not command.strip():
@@ -656,7 +599,8 @@ class InteractConsole:
         print("LSF 批处理命令模式：每条命令独立提交，完成后回显 stdout/stderr。")
         print("队列=%s CPU=%d 初始Conda环境=%s" %
               (self.queue, self.cpu, self.environment_label or "(未激活/由计算节点初始化决定)"))
-        print("环境规则：每个会话最多一次 activate 切换、一次 deactivate 返回 base。")
+        print("环境规则：activate/deactivate 只修改本地会话状态，不提交作业；后续计算作业自动激活目标环境。")
+        print("每个会话最多一次切换到命名环境，以及一次 deactivate 返回 base。")
         print("输入 exit/quit 退出；cd 在登录节点维护工作目录。")
         print("作业脚本和日志: %s" % self.session_dir)
         with TerminalInputFix():
@@ -715,10 +659,11 @@ def print_main_help():
             "  bsub_v4.py interact -h\n"
             "\n"
             "CONDA ENVIRONMENT:\n"
-            "  The active Conda environment is restored before each subsequent job.\n"
-            "  One activate transition is allowed from base/empty to a named env,\n"
-            "  followed by one deactivate transition back to base. Further activate\n"
-            "  or deactivate requests are rejected without submitting a job.\n"
+            "  `conda activate ENV` and `conda deactivate` are local console controls;\n"
+            "  they do not submit an LSF job. The selected environment is injected\n"
+            "  as `source activate ENV` at the start of the next real command job.\n"
+            "  One switch from base/empty to a named env and one switch back to base\n"
+            "  are allowed per session. Repeated transitions are rejected locally.\n"
             "  The prompt displays the active environment, e.g. (base).\n"
             "\n"
             "NOTE: interact is a sequence of independent batch jobs, not a persistent\n"
@@ -760,11 +705,12 @@ def parse_interact(argv):
             "  bsub_v4.py interact -c 1 -n dev -p fatA -l 'hostname'\n"
             "  bsub_v4.py interact -c 1 -n dev -p fatA -e esmfold -l 'python --version'\n"
             "\n"
-            "The -e option is optional and defaults to empty. The active Conda "
-            "environment is restored before each subsequent job. One activate "
-            "transition from base/empty to a named environment and one deactivate "
-            "transition back to base are allowed per session. Additional transition "
-            "requests are rejected without submission. This is not a persistent "
+            "The -e option is optional and defaults to empty. `conda activate ENV` "
+            "and `conda deactivate` only update the local session target; they do "
+            "not submit jobs. The next real command job is prefixed with `source "
+            "activate ENV`. One switch from base/empty to a named environment and "
+            "one switch back to base are allowed per session. Further transitions "
+            "are rejected without submission. This is not a persistent "
             "remote shell and does not provide a TTY/PTY."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
