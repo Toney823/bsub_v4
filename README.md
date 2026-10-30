@@ -58,4 +58,4 @@ python3 bsub_v4.py interact -c 1 -n dev -p fatA -e esmfold -l 'python --version'
 
 ## 许可
 
-暂未附带 LICENSE 文件；如需开源协议，可自行补充。
+本项目采用 [MIT License](LICENSE)。
